@@ -1,0 +1,9 @@
+# config.yml
+database:
+  host: "localhost"
+  port: 5432
+  user: "dbuser"
+  password: "dbpassword"
+  name: "dbname"
+server:
+  port: 8080
