@@ -1,4 +1,4 @@
-package namespace
+package main
 
 import (
 	"github.com/vishvananda/netns"

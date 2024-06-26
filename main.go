@@ -1,160 +1,29 @@
-//package main
-//
-//import (
-//	"fmt"
-//	"github.com/coroot/coroot-node-agent/proc"
-//	"github.com/spf13/cobra"
-//	"github.com/spf13/viper"
-//	"github.com/vishvananda/netns"
-//	"log"
-//	"os"
-//	"regexp"
-//	"test/namespace"
-//)
-//
-//type Config struct {
-//	Database struct {
-//		Host     string
-//		Port     int
-//		User     string
-//		Password string
-//		Name     string
-//	}
-//	Server struct {
-//		Port int
-//	}
-//}
-//
-//type Manager struct {
-//	cfgFile string
-//	config  Config
-//
-//	cgroup *Cgroup
-//
-//	// Namespace
-//	selfNetNs         netns.NsHandle
-//	hostNetNs         netns.NsHandle
-//	hostNetNsId       string
-//	agentPid          uint32
-//	containerIdRegexp *regexp.Regexp
-//}
-//
-//var Mgr *Manager
-//
-//var rootCmd = &cobra.Command{
-//	Use:   "go_build_test",
-//	Short: "test application",
-//}
-//
-//func init() {
-//	Mgr = NewManager()
-//	cobra.OnInitialize(Mgr.initConfig)
-//	rootCmd.PersistentFlags().StringVar(&Mgr.cfgFile, "config", "config.yml", "config file (default is config.yml)")
-//	rootCmd.AddCommand(Mgr.NewCmdRun())
-//}
-//func (mgr *Manager) setNamespace() error {
-//	ns, err := namespace.GetSelfNetNs()
-//	if err != nil {
-//		return fmt.Errorf("Get Self Network Namespace Failed")
-//	}
-//	mgr.selfNetNs = ns
-//
-//	hostNetNs, err := namespace.GetHostNetNs()
-//	if err != nil {
-//		return fmt.Errorf("Get hOST Network Namespace Failed")
-//	}
-//	mgr.hostNetNs = hostNetNs
-//	mgr.hostNetNsId = hostNetNs.UniqueId()
-//
-//	return nil
-//}
-//
-//func (mgr *Manager) NewCmdRun() *cobra.Command {
-//	runCmd := &cobra.Command{
-//		Use:   "run",
-//		Short: "Run the application",
-//		PreRunE: func(cmd *cobra.Command, args []string) error {
-//			viper.SetConfigFile(mgr.cfgFile)
-//			viper.SetConfigType("yaml")
-//
-//			if err := viper.ReadInConfig(); err != nil {
-//				return fmt.Errorf("Error reading config file, %s", err)
-//			}
-//
-//			if err := viper.Unmarshal(&mgr.config); err != nil {
-//				return fmt.Errorf("Unable to decode into struct, %v", err)
-//			}
-//
-//			if mgr.setNamespace() != nil {
-//				return fmt.Errorf("Set Namespace Failed ")
-//			}
-//
-//			return nil
-//		},
-//		RunE: func(cmd *cobra.Command, args []string) error {
-//			// Here you would use the configuration values
-//			//fmt.Printf("Database Host: %s\n", config.Database.Host)
-//
-//			err := proc.ExecuteInNetNs(mgr.hostNetNs, mgr.selfNetNs, func() error {
-//				if err := TaskstatsInit(); err != nil {
-//					return err
-//				}
-//				return nil
-//			})
-//
-//			if err != nil {
-//				return err
-//			}
-//
-//			if namespace.SetCgroupNamespace(mgr.hostNetNs, mgr.selfNetNs) != nil {
-//				return fmt.Errorf("Set Cgroup Namespace Failed")
-//			}
-//
-//			fmt.Println("RUN!!!!!!!!!!!!!")
-//			return nil
-//		},
-//	}
-//
-//	return runCmd
-//}
-//
-//func (mgr *Manager) initConfig() {
-//	if mgr.cfgFile != "" {
-//		viper.SetConfigFile(mgr.cfgFile)
-//	} else {
-//		viper.AddConfigPath(".")
-//		viper.SetConfigName("config")
-//	}
-//	viper.AutomaticEnv()
-//}
-//
-//func NewManager() *Manager {
-//	cg, err := NewFromProcessCgroupFile("/proc/self/cgroup")
-//	if err != nil {
-//		return nil
-//	}
-//	m := &Manager{
-//		hostNetNsId: netns.None().UniqueId(),
-//		selfNetNs:   netns.None(),
-//		agentPid:    uint32(os.Getpid()),
-//		cgroup:      cg,
-//	}
-//	return m
-//}
-//
-//func main() {
-//	if err := rootCmd.Execute(); err != nil {
-//		log.Fatalf("Error executing root command: %v", err)
-//	}
-//}
-
 package main
 
 import (
+	"bytes"
+	"context"
 	"fmt"
-	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
-	"log"
+	ebpfspy "github.com/grafana/pyroscope/ebpf"
+	"github.com/grafana/pyroscope/ebpf/metrics"
+	"github.com/grafana/pyroscope/ebpf/symtab"
+	"github.com/grafana/pyroscope/ebpf/symtab/elf"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/vishvananda/netns"
+	"golang.org/x/sync/errgroup"
+	"k8s.io/klog/v2"
+	_ "net/http/pprof"
+	"os"
+	"os/signal"
+	"regexp"
+	"strings"
+	"syscall"
+
+	"github.com/coroot/coroot-node-agent/containers"
+	"github.com/coroot/coroot-node-agent/proc"
+	"github.com/coroot/coroot-node-agent/profiling"
+	"github.com/go-kit/log"
+	"golang.org/x/sys/unix"
 )
 
 type Config struct {
@@ -170,66 +39,216 @@ type Config struct {
 	}
 }
 
-var (
+type Manager struct {
 	cfgFile string
 	config  Config
-)
 
-var rootCmd = &cobra.Command{
-	Use:   "myapp",
-	Short: "My application",
-}
+	cgroup *Cgroup
 
-var runCmd = &cobra.Command{
-	Use:   "run",
-	Short: "Run the application",
-	PreRunE: func(cmd *cobra.Command, args []string) error {
-		viper.SetConfigFile(cfgFile)
-		viper.SetConfigType("yaml")
+	// Namespace
+	selfNetNs   netns.NsHandle
+	hostNetNs   netns.NsHandle
+	hostNetNsId string
 
-		if err := viper.ReadInConfig(); err != nil {
-			return fmt.Errorf("Error reading config file, %s", err)
-		}
+	hostname   string
+	systemUUID string
+	machineId  string
 
-		if err := viper.Unmarshal(&config); err != nil {
-			return fmt.Errorf("Unable to decode into struct, %v", err)
-		}
+	agentPid          uint32
+	containerIdRegexp *regexp.Regexp
 
-		return nil
-	},
-	RunE: func(cmd *cobra.Command, args []string) error {
-		// Here you would use the configuration values
-		fmt.Printf("Database Host: %s\n", config.Database.Host)
-		fmt.Printf("Database Port: %d\n", config.Database.Port)
-		fmt.Printf("Database User: %s\n", config.Database.User)
-		fmt.Printf("Database Password: %s\n", config.Database.Password)
-		fmt.Printf("Database Name: %s\n", config.Database.Name)
-		fmt.Printf("Server Port: %d\n", config.Server.Port)
-
-		// Add your application logic here
-
-		return nil
-	},
+	processInfoCh chan<- containers.ProcessInfo
 }
 
 func init() {
-	cobra.OnInitialize(initConfig)
-	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "config.yml", "config file (default is config.yml)")
-	rootCmd.AddCommand(runCmd)
+
 }
 
-func initConfig() {
-	if cfgFile != "" {
-		viper.SetConfigFile(cfgFile)
-	} else {
-		viper.AddConfigPath(".")
-		viper.SetConfigName("config")
+func machineID() string {
+	for _, p := range []string{"/etc/machine-id", "/var/lib/dbus/machine-id", "/sys/devices/virtual/dmi/id/product_uuid"} {
+		payload, err := os.ReadFile(proc.HostPath(p))
+		if err != nil {
+			klog.Warningln("failed to read machine-id:", err)
+			continue
+		}
+		id := strings.TrimSpace(strings.Replace(string(payload), "-", "", -1))
+		klog.Infoln("machine-id: ", id)
+		return id
 	}
-	viper.AutomaticEnv()
+	return ""
+}
+
+func systemUUID() string {
+	payload, err := os.ReadFile(proc.HostPath("/sys/devices/virtual/dmi/id/product_uuid"))
+	if err != nil {
+		klog.Warningln("failed to read system-uuid:", err)
+		return ""
+	}
+	return strings.TrimSpace(string(payload))
+}
+
+func (mgr *Manager) setNamespace() error {
+	ns, err := GetSelfNetNs()
+	if err != nil {
+		return fmt.Errorf("Get Self Network Namespace Failed, %v \n", err)
+	}
+	mgr.selfNetNs = ns
+
+	hostNetNs, err := GetHostNetNs()
+	if err != nil {
+		return fmt.Errorf("Get Host Network Namespace Failed %v \n", err)
+	}
+	mgr.hostNetNs = hostNetNs
+	mgr.hostNetNsId = hostNetNs.UniqueId()
+
+	return nil
+}
+
+func NewManager() *Manager {
+	cg, err := NewFromProcessCgroupFile("/proc/self/cgroup")
+	if err != nil {
+		return nil
+	}
+	m := &Manager{
+		hostNetNsId: netns.None().UniqueId(),
+		selfNetNs:   netns.None(),
+		agentPid:    uint32(os.Getpid()),
+		cgroup:      cg,
+	}
+	return m
+}
+
+func (mgr *Manager) Init() error {
+
+	if err := mgr.setNamespace(); err != nil {
+		return fmt.Errorf("Set Namespace Failed %v \n", err)
+	}
+
+	err := proc.ExecuteInNetNs(mgr.hostNetNs, mgr.selfNetNs, func() error {
+		if err := TaskstatsInit(); err != nil {
+			return err
+		}
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	if err := SetCgroupNamespace(mgr.hostNetNs, mgr.selfNetNs); err != nil {
+		return fmt.Errorf("Set Cgroup Namespace Failed %v \n", err)
+	}
+
+	mgr.machineId = machineID()
+	mgr.systemUUID = systemUUID()
+	var utsname unix.Utsname
+	if err := unix.Uname(&utsname); err != nil {
+		return fmt.Errorf("init Uname Failed %v \n", err)
+	}
+	mgr.hostname = string(bytes.Split(utsname.Nodename[:], []byte{0})[0])
+
+	whitelistNodeExternalNetworks()
+
+	return nil
+}
+
+func (mgr *Manager) Run() error {
+	var g errgroup.Group
+
+	if err := mgr.Init(); err != nil {
+		return fmt.Errorf("init Failed %v \n", err)
+	}
+
+	g.Go(func() error {
+		fmt.Println("Run Profiling")
+
+		mgr.processInfoCh = profiling.Init(mgr.machineId, mgr.hostname)
+		reg := prometheus.NewRegistry()
+		so := ebpfspy.SessionOptions{
+			CollectUser:               true,
+			CollectKernel:             false,
+			UnknownSymbolModuleOffset: true,
+			UnknownSymbolAddress:      false,
+			PythonEnabled:             true,
+			CacheOptions: symtab.CacheOptions{
+				PidCacheOptions: symtab.GCacheOptions{
+					Size:       256,
+					KeepRounds: 8,
+				},
+				BuildIDCacheOptions: symtab.GCacheOptions{
+					Size:       256,
+					KeepRounds: 8,
+				},
+				SameFileCacheOptions: symtab.GCacheOptions{
+					Size:       256,
+					KeepRounds: 8,
+				},
+				SymbolOptions: symtab.SymbolOptions{
+					GoTableFallback:    true,
+					PythonFullFilePath: false,
+					DemangleOptions:    elf.DemangleFull,
+				},
+			},
+			Metrics: &metrics.Metrics{
+				Symtab: metrics.NewSymtabMetrics(reg),
+				Python: metrics.NewPythonMetrics(reg),
+			},
+			SampleRate: SampleRate,
+		}
+		var err error
+		session, err = ebpfspy.NewSession(log.NewNopLogger(), ProcessTargetFinder, so)
+		if err != nil {
+			klog.Errorln(err)
+			session = nil
+			return nil
+		}
+		err = session.Start()
+		if err != nil {
+			klog.Errorln(err)
+			session = nil
+			return nil
+		}
+		go collect()
+
+		processInfoCh := make(chan containers.ProcessInfo)
+		//targetFinder.start(processInfoCh)
+		ProcessTargetFinder.start(processInfoCh)
+		//return processInfoCh
+
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		fmt.Printf("Error: %v\n", err)
+	} else {
+		fmt.Println("Successfully fetched all URLs.")
+	}
+
+	return nil
+
 }
 
 func main() {
-	if err := rootCmd.Execute(); err != nil {
-		log.Fatalf("Error executing root command: %v", err)
+
+	if err := NewManager().Run(); err != nil {
+		klog.Fatalf("Run Failed %v \n", err)
 	}
+
+	// 컨텍스트와 취소 함수 생성
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// 채널을 통해 시그널을 수신
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
+
+	// 고루틴에서 시그널 대기
+	go func() {
+		sig := <-signalChan
+		fmt.Printf("Received signal: %s\n", sig)
+		cancel() // 컨텍스트 취소
+	}()
+
+	fmt.Println("Waiting for signal...")
+	<-ctx.Done() // 컨텍스트가 취소될 때까지 대기
+
 }
