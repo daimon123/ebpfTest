@@ -94,5 +94,4 @@ func whitelistNodeExternalNetworks() {
 			common.ConnectionFilter.WhitelistPrefix(p)
 		}
 	}
-
 }

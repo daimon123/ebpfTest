@@ -2,9 +2,8 @@ package main
 
 import (
 	"fmt"
-	"sync"
-
 	"github.com/mdlayher/taskstats"
+	"sync"
 )
 
 var (

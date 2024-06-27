@@ -27,25 +27,6 @@ var (
 	pingTimeout = 300 * time.Millisecond
 )
 
-type ContainerID string
-
-type ContainerNetwork struct {
-	NetworkID string
-}
-
-type ContainerMetadata struct {
-	name               string
-	labels             map[string]string
-	volumes            map[string]string
-	logPath            string
-	image              string
-	logDecoder         logparser.Decoder
-	hostListens        map[string][]netaddr.IPPort
-	networks           map[string]ContainerNetwork
-	env                map[string]string
-	systemdTriggeredBy string
-}
-
 type Delays struct {
 	cpu  time.Duration
 	disk time.Duration
@@ -90,7 +71,6 @@ type PidFd struct {
 	Pid uint32
 	Fd  uint64
 }
-
 type Container struct {
 	id       ContainerID
 	cgroup   *cgroup.Cgroup
@@ -132,9 +112,12 @@ type Container struct {
 	lock sync.RWMutex
 
 	done chan struct{}
+
+	// Customize
+	manager *Manager
 }
 
-func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, hostConntrack *Conntrack, pid uint32) (*Container, error) {
+func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, hostConntrack *Conntrack, pid uint32, mgr *Manager) (*Container, error) {
 	netNs, err := proc.GetNetNs(pid)
 	if err != nil {
 		return nil, err
@@ -167,7 +150,8 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, host
 
 		hostConntrack: hostConntrack,
 
-		done: make(chan struct{}),
+		done:    make(chan struct{}),
+		manager: mgr,
 	}
 
 	for _, n := range md.networks {
@@ -198,7 +182,6 @@ func NewContainer(id ContainerID, cg *cgroup.Cgroup, md *ContainerMetadata, host
 
 	return c, nil
 }
-
 func (c *Container) Close() {
 	for _, p := range c.logParsers {
 		p.Stop()
@@ -366,7 +349,7 @@ func (c *Container) onProcessStart(pid uint32) *Process {
 		return nil
 	}
 	c.zombieAt = time.Time{}
-	p := NewProcess(pid, stats)
+	p := NewProcess(pid, stats, c.manager)
 	if p == nil {
 		return nil
 	}
@@ -816,8 +799,10 @@ func (c *Container) getProxiedListens() map[string]map[netaddr.IPPort]struct{} {
 func (c *Container) ping() map[netaddr.IP]float64 {
 	netNs := netns.None()
 	for pid := range c.processes {
-		if pid == agentPid {
-			netNs = selfNetNs
+		//if pid == agentPid {
+		if pid == c.manager.agentPid {
+			//netNs = selfNetNs
+			netNs = c.manager.selfNetNs
 			break
 		}
 		ns, err := proc.GetNetNs(pid)
@@ -855,7 +840,7 @@ func (c *Container) ping() map[netaddr.IP]float64 {
 		}
 		targets = append(targets, ip)
 	}
-	rtt, err := pinger.Ping(netNs, selfNetNs, targets, pingTimeout)
+	rtt, err := pinger.Ping(netNs, c.manager.selfNetNs, targets, pingTimeout)
 	if err != nil {
 		klog.Warningln(err)
 		return nil

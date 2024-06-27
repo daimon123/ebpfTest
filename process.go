@@ -21,13 +21,15 @@ type Process struct {
 
 	dotNetMonitor *DotNetMonitor
 
+	manager *Manager
+
 	uprobes               []link.Link
 	goTlsUprobesChecked   bool
 	openSslUprobesChecked bool
 }
 
-func NewProcess(pid uint32, stats *taskstats.Stats) *Process {
-	p := &Process{Pid: pid, StartedAt: stats.BeginTime}
+func NewProcess(pid uint32, stats *taskstats.Stats, mgr *Manager) *Process {
+	p := &Process{Pid: pid, StartedAt: stats.BeginTime, manager: mgr}
 	p.ctx, p.cancelFunc = context.WithCancel(context.Background())
 	go p.instrument()
 	return p
@@ -46,7 +48,7 @@ func (p *Process) NetNsId() string {
 }
 
 func (p *Process) isHostNs() bool {
-	return p.NetNsId() == hostNetNsId
+	return p.NetNsId() == p.manager.hostNetNsId
 }
 
 func (p *Process) instrument() {
